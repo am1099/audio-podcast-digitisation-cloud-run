@@ -3,6 +3,15 @@ import fs from "fs";
 import fetch from "node-fetch";
 import { exec } from "child_process";
 import { createClient } from "@supabase/supabase-js";
+import cors from "cors";
+
+app.use(cors({
+  origin: "*", // for now, allow all
+  methods: ["POST", "GET", "OPTIONS"],
+  allowedHeaders: ["Content-Type"]
+}));
+
+app.options("*", cors());
 
 const app = express();
 app.use(express.json());
