@@ -4,8 +4,13 @@ import fetch from "node-fetch";
 import { exec } from "child_process";
 import { createClient } from "@supabase/supabase-js";
 import cors from "cors";
+import multer from "multer";
 
 const app = express();
+
+const upload = multer({
+  dest: "/tmp",
+});
 
 app.use(cors({
   origin: "*", // for now, allow all
@@ -22,25 +27,25 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-app.post("/convert", async (req, res) => {
+app.post("/convert", upload.single("audio"), async (req, res) => {
   try {
-    const { programId, mp3_url, title } = req.body;
+    if (!req.file) {
+      return res.status(400).json({ error: "No audio file uploaded" });
+    }
 
-    const inputPath = `/tmp/input.mp3`;
-    const outputPath = `/tmp/output.mp4`;
+    const { programId } = req.body;
 
-    const response = await fetch(mp3_url);
-    const buffer = await response.arrayBuffer();
-    fs.writeFileSync(inputPath, Buffer.from(buffer));
+    if (!programId) {
+      return res.status(400).json({ error: "Missing programId" });
+    }
 
-    const command = `
-      ffmpeg -y -f lavfi -i color=c=black:s=1080x1920:d=60 \
-      -i ${inputPath} \
-      -shortest \
-      -vf "drawtext=text='${title}':fontcolor=white:fontsize=60:x=(w-text_w)/2:y=900" \
-      -c:v libx264 -c:a aac -pix_fmt yuv420p \
-      ${outputPath}
-    `;
+    const inputPath = req.file.path;
+    const outputPath = `/tmp/output-${Date.now()}.mp4`;
+    const videoFileName = `video-${programId}.mp4`;
+
+    console.log("Audio received:", inputPath);
+
+    const command = `ffmpeg -y -i "${inputPath}" -c:v libx264 -c:a aac "${outputPath}"`;
 
     await new Promise((resolve, reject) => {
       exec(command, (error) => {
@@ -49,28 +54,60 @@ app.post("/convert", async (req, res) => {
       });
     });
 
+    console.log("FFmpeg completed");
+
+    // 🔹 Read generated video
     const videoBuffer = fs.readFileSync(outputPath);
 
-    await supabase.storage
+    // 🔹 Upload to Supabase Storage
+    const { error: uploadError } = await supabase.storage
       .from("video-files")
-      .upload(`video-${programId}.mp4`, videoBuffer, {
+      .upload(videoFileName, videoBuffer, {
         contentType: "video/mp4",
-        upsert: true
+        upsert: true,
       });
 
-    await supabase
+    if (uploadError) {
+      console.error("Upload error:", uploadError);
+      return res.status(500).json({ error: "Storage upload failed" });
+    }
+
+    // 🔹 Get public URL
+    const { data: publicUrlData } = supabase.storage
+      .from("video-files")
+      .getPublicUrl(videoFileName);
+
+    const publicUrl = publicUrlData.publicUrl;
+
+    // 🔹 Update DB
+    const { error: dbError } = await supabase
       .from("programs")
       .update({
-        mp4_path: `video-${programId}.mp4`,
-        status: "completed"
+        mp4_path: videoFileName,
+        status: "completed",
       })
       .eq("id", programId);
 
-    res.json({ success: true });
+    if (dbError) {
+      console.error("DB update error:", dbError);
+      return res.status(500).json({ error: "Database update failed" });
+    }
+
+    console.log("Supabase updated successfully");
+
+    res.json({
+      success: true,
+      videoUrl: publicUrl,
+    });
+
   } catch (error) {
-    console.error(error);
+    console.error("Conversion error:", error);
     res.status(500).json({ error: "Conversion failed" });
   }
 });
 
-app.listen(process.env.PORT || 8080);
+const PORT = process.env.PORT || 8080;
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
