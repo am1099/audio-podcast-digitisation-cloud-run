@@ -5,6 +5,8 @@ import { exec } from "child_process";
 import { createClient } from "@supabase/supabase-js";
 import cors from "cors";
 
+const app = express();
+
 app.use(cors({
   origin: "*", // for now, allow all
   methods: ["POST", "GET", "OPTIONS"],
@@ -13,7 +15,6 @@ app.use(cors({
 
 app.options("*", cors());
 
-const app = express();
 app.use(express.json());
 
 const supabase = createClient(
