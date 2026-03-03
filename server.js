@@ -82,11 +82,15 @@ app.post("/convert", upload.single("audio"), async (req, res) => {
     // 🔹 Update DB
     const { error: dbError } = await supabase
       .from("programs")
-      .update({
+      .insert({
         mp4_path: videoFileName,
         status: "completed",
-      })
-      .eq("id", programId);
+      });
+
+if (dbError) {
+  console.error("DB insert error:", dbError);
+  return res.status(500).json({ error: "Database insert failed" });
+}
 
     if (dbError) {
       console.error("DB update error:", dbError);
