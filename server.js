@@ -33,16 +33,10 @@ app.post("/convert", upload.single("audio"), async (req, res) => {
       return res.status(400).json({ error: "No audio file uploaded" });
     }
 
-    const { programId } = req.body;
-
-    if (!programId) {
-      return res.status(400).json({ error: "Missing programId" });
-    }
-
     const inputPath = req.file.path;
     const outputPath = `/tmp/output-${Date.now()}.mp4`;
-    const videoFileName = `video-${programId}.mp4`;
-
+    const videoFileName = `video-${Date.now()}.mp4`;
+    
     console.log("Audio received:", inputPath);
 
     const command = `ffmpeg -y -i "${inputPath}" -c:v libx264 -c:a aac "${outputPath}"`;
