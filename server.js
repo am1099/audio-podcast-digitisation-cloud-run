@@ -1,10 +1,11 @@
 import express from "express";
 import fs from "fs";
-import { exec } from "child_process";
+import { spawn } from "child_process";
 import { createClient } from "@supabase/supabase-js";
 import cors from "cors";
 import multer from "multer";
 import { GoogleGenAI } from "@google/genai";
+
 const app = express();
 
 const genAI = new GoogleGenAI({
@@ -145,9 +146,9 @@ app.post("/convert", upload.single("audio"), async (req, res) => {
     
     fs.writeFileSync(backgroundImage, Buffer.from(buffer));
 
-console.log("Background image downloaded");
-
-console.log("AI background image created:", backgroundImage);
+    console.log("Background image downloaded");
+    
+    console.log("AI background image created:", backgroundImage);
 
     /*
     =========================
@@ -155,26 +156,29 @@ console.log("AI background image created:", backgroundImage);
     =========================
     */
 
-    const command = `
-    ffmpeg -y \
-    -loop 1 -i "${backgroundImage}" \
-    -i "${inputPath}" \
-    -vf "subtitles=${subtitlePath}" \
-    -c:v libx264 \
-    -c:a aac \
-    -shortest "${outputPath}"
-    `;
-
     await new Promise((resolve, reject) => {
-
-      exec(command, (error) => {
-
-        if (error) reject(error);
-
-        else resolve();
-
+    
+      const ffmpeg = spawn("ffmpeg", [
+        "-y",
+        "-loop", "1",
+        "-i", backgroundImage,
+        "-i", inputPath,
+        "-vf", `subtitles=${subtitlePath}`,
+        "-c:v", "libx264",
+        "-c:a", "aac",
+        "-shortest",
+        outputPath
+      ]);
+    
+      ffmpeg.stderr.on("data", (data) => {
+        console.log(`ffmpeg: ${data}`);
       });
-
+    
+      ffmpeg.on("close", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`FFmpeg exited with code ${code}`));
+      });
+    
     });
 
     console.log("FFmpeg completed");
