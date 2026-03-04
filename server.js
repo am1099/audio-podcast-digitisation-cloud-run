@@ -5,8 +5,6 @@ import { createClient } from "@supabase/supabase-js";
 import cors from "cors";
 import multer from "multer";
 import { GoogleGenAI } from "@google/genai";
-import https from "https";
-
 
 const app = express();
 
@@ -22,17 +20,6 @@ app.use(cors({
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: false
 }));
-
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  next();
-});
-
-app.options("*", (req, res) => {
-  res.status(200).send();
-});
 
 app.use(express.json());
 
@@ -70,13 +57,13 @@ app.post("/convert", upload.single("audio"), async (req, res) => {
 
     const audioData = fs.readFileSync(inputPath).toString("base64");
 
-    const response = await genAI.models.generateContent({
+    const transcriptResponse = await genAI.models.generateContent({
       model: "gemini-2.5-flash",
       contents: [
         {
           role: "user",
           parts: [
-            { text: "Transcribe this radio broadcast audio." },
+            { text: "Transcribe this radio broadcast audio. Return plain text only." },
             {
               inlineData: {
                 mimeType: "audio/mp3",
@@ -87,31 +74,78 @@ app.post("/convert", upload.single("audio"), async (req, res) => {
         }
       ]
     });
-    
-    const transcript = response.text;
+
+    const transcript = transcriptResponse.text;
 
     console.log("Transcript generated");
 
     /*
     =========================
-    STEP 2 — Subtitle Generation
+    STEP 2 — Generate AI Metadata
     =========================
     */
 
-    const lines = transcript.split("\n");
+    const metadataResponse = await genAI.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: `
+You are analyzing a radio broadcast transcript.
+
+Return ONLY valid JSON:
+
+{
+"summary": "...",
+"description": "...",
+"keywords": ["..."]
+}
+
+Transcript:
+${transcript}
+`
+    });
+
+    let summaryText = "";
+    let descriptionText = "";
+    let aiKeywords = [];
+
+    try {
+
+      const metadata = JSON.parse(metadataResponse.text);
+
+      summaryText = metadata.summary;
+      descriptionText = metadata.description;
+      aiKeywords = metadata.keywords;
+
+    } catch {
+
+      console.log("Metadata parsing failed, using fallback");
+
+    }
+
+    /*
+    =========================
+    STEP 3 — Subtitle Generation
+    =========================
+    */
+
+    const sentences = transcript
+      .replace(/\n/g, " ")
+      .split(/[.!?]/)
+      .filter(Boolean);
 
     let srt = "";
     let index = 1;
 
-    lines.forEach((line, i) => {
+    const durationPerLine = 3;
 
-      const start = i * 4;
-      const end = start + 4;
+    sentences.forEach((sentence, i) => {
+
+      const start = i * durationPerLine;
+      const end = start + durationPerLine;
 
       const startTime = new Date(start * 1000).toISOString().substr(11, 8) + ",000";
       const endTime = new Date(end * 1000).toISOString().substr(11, 8) + ",000";
 
-      srt += `${index}\n${startTime} --> ${endTime}\n${line}\n\n`;
+      srt += `${index}\n${startTime} --> ${endTime}\n${sentence.trim()}\n\n`;
 
       index++;
 
@@ -125,92 +159,51 @@ app.post("/convert", upload.single("audio"), async (req, res) => {
 
     /*
     =========================
-    STEP 3 — AI Background Prompt
+    STEP 4 — Background Image
     =========================
-    */
-
-    const imagePrompt = `
-    cinematic radio podcast background
-    
-    topic: ${keywords.join(", ")}
-    
-    style: dark studio lighting
-    microphone
-    broadcast desk
-    modern radio show
-    `;
-    
-    console.log("Image prompt:", imagePrompt);
-    
-    /*
-    Use Unsplash random image API
     */
 
     const backgroundImage = "./assets/radio_background.jpg";
-    
-    // const query = encodeURIComponent(keywords.join(" "));
-    // const imageUrl = `https://source.unsplash.com/1280x720/?${query},podcast,studio`;
-    
-    // const backgroundImage = "/tmp/background.jpg";
-    
-    // await new Promise((resolve, reject) => {
-    
-    //   const file = fs.createWriteStream(backgroundImage);
-    
-    //   https.get(imageUrl, (response) => {
-    
-    //     response.pipe(file);
-    
-    //     file.on("finish", () => {
-    //       file.close(resolve);
-    //     });
-    
-    //   }).on("error", (err) => {
-    
-    //     fs.unlink(backgroundImage, () => reject(err));
-    
-    //   });
-    
-    // });
-    
-    // console.log("Background image downloaded");
 
     /*
     =========================
-    STEP 4 — FFmpeg Rendering
+    STEP 5 — FFmpeg Rendering
     =========================
     */
 
     await new Promise((resolve, reject) => {
-    
+
       const ffmpeg = spawn("ffmpeg", [
         "-y",
         "-loop", "1",
         "-i", backgroundImage,
         "-i", inputPath,
-        "-vf", `scale=1280:720,subtitles=${subtitlePath}`,
+        "-vf", `scale=1280:720,subtitles=${subtitlePath}:force_style='Fontsize=26,PrimaryColour=&Hffffff&,OutlineColour=&H000000&,BorderStyle=3'`,
         "-c:v", "libx264",
+        "-preset", "veryfast",
         "-c:a", "aac",
         "-shortest",
         outputPath
       ]);
-    
+
       ffmpeg.stderr.on("data", (data) => {
         console.log(`ffmpeg: ${data}`);
       });
-    
+
       ffmpeg.on("close", (code) => {
+
         if (code === 0) resolve();
         else reject(new Error(`FFmpeg exited with code ${code}`));
+
       });
-    
+
     });
 
     console.log("FFmpeg completed");
 
     /*
     =========================
-    STEP 5 — Upload Video
+    STEP 6 — Upload Video
     =========================
     */
 
@@ -239,7 +232,7 @@ app.post("/convert", upload.single("audio"), async (req, res) => {
 
     /*
     =========================
-    STEP 6 — Update DB
+    STEP 7 — Update Database
     =========================
     */
 
@@ -271,7 +264,10 @@ app.post("/convert", upload.single("audio"), async (req, res) => {
     res.json({
       success: true,
       videoUrl: publicUrl,
-      transcript: transcript
+      summary: summaryText,
+      description: descriptionText,
+      transcript: transcript,
+      keywords: aiKeywords.length ? aiKeywords : keywords
     });
 
   }
