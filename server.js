@@ -117,41 +117,35 @@ app.post("/convert", upload.single("audio"), async (req, res) => {
     */
 
     const imagePrompt = `
-    Create a cinematic radio broadcast background.
+    cinematic radio podcast background
     
-    Topic keywords:
-    ${keywords.join(", ")}
+    topic: ${keywords.join(", ")}
     
-    Style:
-    modern podcast studio
-    dark cinematic lighting
-    professional broadcast graphics
-    1280x720 resolution
+    style: dark studio lighting
+    microphone
+    broadcast desk
+    modern radio show
     `;
     
     console.log("Image prompt:", imagePrompt);
     
-    const backgroundImage = "/tmp/background.png";
+    /*
+    Use Unsplash random image API
+    */
+    
+    const query = encodeURIComponent(keywords.join(" "));
+    
+    const backgroundImage = "/tmp/background.jpg";
+    
+    const imageUrl = `https://source.unsplash.com/1280x720/?${query},podcast,studio`;
+    
+    const responseImg = await fetch(imageUrl);
+    
+    const buffer = await responseImg.arrayBuffer();
+    
+    fs.writeFileSync(backgroundImage, Buffer.from(buffer));
 
-/*
-Generate image with Imagen
-*/
-
-const imageResponse = await genAI.models.generateImages({
-  model: "imagen-3.0-generate-001",
-  prompt: imagePrompt,
-  config: {
-    numberOfImages: 1,
-    aspectRatio: "16:9"
-  }
-});
-
-const imageBase64 = imageResponse.generatedImages[0].image.imageBytes;
-
-fs.writeFileSync(
-  backgroundImage,
-  Buffer.from(imageBase64, "base64")
-);
+console.log("Background image downloaded");
 
 console.log("AI background image created:", backgroundImage);
 
