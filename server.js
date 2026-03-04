@@ -5,6 +5,8 @@ import { createClient } from "@supabase/supabase-js";
 import cors from "cors";
 import multer from "multer";
 import { GoogleGenAI } from "@google/genai";
+import https from "https";
+
 
 const app = express();
 
@@ -135,20 +137,31 @@ app.post("/convert", upload.single("audio"), async (req, res) => {
     */
     
     const query = encodeURIComponent(keywords.join(" "));
+    const imageUrl = `https://source.unsplash.com/1280x720/?${query},podcast,studio`;
     
     const backgroundImage = "/tmp/background.jpg";
     
-    const imageUrl = `https://source.unsplash.com/1280x720/?${query},podcast,studio`;
+    await new Promise((resolve, reject) => {
     
-    const responseImg = await fetch(imageUrl);
+      const file = fs.createWriteStream(backgroundImage);
     
-    const buffer = await responseImg.arrayBuffer();
+      https.get(imageUrl, (response) => {
     
-    fs.writeFileSync(backgroundImage, Buffer.from(buffer));
-
+        response.pipe(file);
+    
+        file.on("finish", () => {
+          file.close(resolve);
+        });
+    
+      }).on("error", (err) => {
+    
+        fs.unlink(backgroundImage, () => reject(err));
+    
+      });
+    
+    });
+    
     console.log("Background image downloaded");
-    
-    console.log("AI background image created:", backgroundImage);
 
     /*
     =========================
