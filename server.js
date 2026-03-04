@@ -16,9 +16,8 @@ const upload = multer({ dest: "/tmp" });
 
 app.use(cors({
   origin: "*",
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-  credentials: false
+  methods: ["GET","POST","PUT","DELETE","OPTIONS"],
+  allowedHeaders: ["Content-Type","Authorization"]
 }));
 
 app.use(express.json());
@@ -28,264 +27,234 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-app.post("/convert", upload.single("audio"), async (req, res) => {
+app.post("/convert", upload.single("audio"), async (req,res)=>{
 
-  try {
+try {
 
-    if (!req.file) {
-      return res.status(400).json({ error: "No audio file uploaded" });
-    }
-
-    const keywords = JSON.parse(req.body.keywords || "[]");
-    const programId = req.body.programId;
-
-    if (!programId) {
-      return res.status(400).json({ error: "Missing programId" });
-    }
-
-    const inputPath = req.file.path;
-    const outputPath = `/tmp/output-${Date.now()}.mp4`;
-    const videoFileName = `video-${Date.now()}.mp4`;
-
-    console.log("Audio received:", inputPath);
-
-    /*
-    =========================
-    STEP 1 — Transcription
-    =========================
-    */
-
-    const audioData = fs.readFileSync(inputPath).toString("base64");
-
-    const transcriptResponse = await genAI.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: [
-        {
-          role: "user",
-          parts: [
-            { text: "Transcribe this radio broadcast audio. Return plain text only." },
-            {
-              inlineData: {
-                mimeType: "audio/mp3",
-                data: audioData
-              }
-            }
-          ]
-        }
-      ]
-    });
-
-    const transcript = transcriptResponse.text;
-
-    console.log("Transcript generated");
-
-    /*
-    =========================
-    STEP 2 — Generate AI Metadata
-    =========================
-    */
-
-    const metadataResponse = await genAI.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: `
-You are analyzing a radio broadcast transcript.
-
-Return ONLY valid JSON:
-
-{
-"summary": "...",
-"description": "...",
-"keywords": ["..."]
+if(!req.file){
+return res.status(400).json({error:"No audio file uploaded"});
 }
 
-Transcript:
-${transcript}
+const keywords = JSON.parse(req.body.keywords || "[]");
+const programId = req.body.programId;
+
+if(!programId){
+return res.status(400).json({error:"Missing programId"});
+}
+
+const inputPath = req.file.path;
+const outputPath = `/tmp/output-${Date.now()}.mp4`;
+const videoFileName = `video-${Date.now()}.mp4`;
+
+console.log("Audio received:",inputPath);
+
+/*
+STEP 1 — Send audio to Gemini
+*/
+
+const audioData = fs.readFileSync(inputPath).toString("base64");
+
+const aiResponse = await genAI.models.generateContent({
+model:"gemini-2.5-flash",
+contents:[
+{
+role:"user",
+parts:[
+{
+text:`
+You are processing a radio broadcast.
+
+1. Transcribe the audio.
+2. Generate SRT subtitles with correct timing.
+3. Write a short summary.
+4. Write a YouTube style description.
+5. Extract 10 SEO keywords.
+
+Return ONLY JSON:
+
+{
+"transcript":"...",
+"srt":"...",
+"summary":"...",
+"description":"...",
+"keywords":["..."]
+}
 `
-    });
+},
+{
+inlineData:{
+mimeType:"audio/mp3",
+data:audioData
+}
+}
+]
+}
+]
+});
 
-    let summaryText = "";
-    let descriptionText = "";
-    let aiKeywords = [];
+console.log("Gemini response received");
 
-    try {
+let transcript="";
+let summaryText="";
+let descriptionText="";
+let aiKeywords=[];
+let srt="";
 
-      const metadata = JSON.parse(metadataResponse.text);
+try{
 
-      summaryText = metadata.summary;
-      descriptionText = metadata.description;
-      aiKeywords = metadata.keywords;
+const aiData = JSON.parse(aiResponse.text);
 
-    } catch {
+transcript = aiData.transcript || "";
+summaryText = aiData.summary || "";
+descriptionText = aiData.description || "";
+aiKeywords = aiData.keywords || [];
+srt = aiData.srt || "";
 
-      console.log("Metadata parsing failed, using fallback");
+}catch(err){
 
-    }
+console.log("AI JSON parsing failed, fallback subtitles");
 
-    /*
-    =========================
-    STEP 3 — Subtitle Generation
-    =========================
-    */
+transcript = aiResponse.text;
 
-    const sentences = transcript
-      .replace(/\n/g, " ")
-      .split(/[.!?]/)
-      .filter(Boolean);
+/* fallback subtitle generator */
 
-    let srt = "";
-    let index = 1;
+const sentences = transcript
+.replace(/\n/g," ")
+.split(/[.!?]/)
+.filter(Boolean);
 
-    const durationPerLine = 3;
+let index=1;
 
-    sentences.forEach((sentence, i) => {
+sentences.forEach((sentence,i)=>{
 
-      const start = i * durationPerLine;
-      const end = start + durationPerLine;
+const start=i*3;
+const end=start+3;
 
-      const startTime = new Date(start * 1000).toISOString().substr(11, 8) + ",000";
-      const endTime = new Date(end * 1000).toISOString().substr(11, 8) + ",000";
+const startTime=new Date(start*1000).toISOString().substr(11,8)+",000";
+const endTime=new Date(end*1000).toISOString().substr(11,8)+",000";
 
-      srt += `${index}\n${startTime} --> ${endTime}\n${sentence.trim()}\n\n`;
+srt+=`${index}\n${startTime} --> ${endTime}\n${sentence.trim()}\n\n`;
 
-      index++;
-
-    });
-
-    const subtitlePath = "/tmp/subtitles.srt";
-
-    fs.writeFileSync(subtitlePath, srt);
-
-    console.log("Subtitles generated");
-
-    /*
-    =========================
-    STEP 4 — Background Image
-    =========================
-    */
-
-    const backgroundImage = "./assets/radio_background.jpg";
-
-    /*
-    =========================
-    STEP 5 — FFmpeg Rendering
-    =========================
-    */
-
-    await new Promise((resolve, reject) => {
-
-      const ffmpeg = spawn("ffmpeg", [
-        "-y",
-        "-loop", "1",
-        "-i", backgroundImage,
-        "-i", inputPath,
-        "-vf", `scale=1280:720,subtitles=${subtitlePath}:force_style='Fontsize=26,PrimaryColour=&Hffffff&,OutlineColour=&H000000&,BorderStyle=3'`,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-c:a", "aac",
-        "-shortest",
-        outputPath
-      ]);
-
-      ffmpeg.stderr.on("data", (data) => {
-        console.log(`ffmpeg: ${data}`);
-      });
-
-      ffmpeg.on("close", (code) => {
-
-        if (code === 0) resolve();
-        else reject(new Error(`FFmpeg exited with code ${code}`));
-
-      });
-
-    });
-
-    console.log("FFmpeg completed");
-
-    /*
-    =========================
-    STEP 6 — Upload Video
-    =========================
-    */
-
-    const videoBuffer = fs.readFileSync(outputPath);
-
-    const { error: uploadError } = await supabase.storage
-      .from("video-files")
-      .upload(videoFileName, videoBuffer, {
-        contentType: "video/mp4",
-        upsert: true
-      });
-
-    if (uploadError) {
-
-      console.error("Upload error:", uploadError);
-
-      return res.status(500).json({ error: "Storage upload failed" });
-
-    }
-
-    const { data } = supabase.storage
-      .from("video-files")
-      .getPublicUrl(videoFileName);
-
-    const publicUrl = data.publicUrl;
-
-    /*
-    =========================
-    STEP 7 — Update Database
-    =========================
-    */
-
-    const { error: dbError } = await supabase
-      .from("programs")
-      .update({
-        mp4_path: videoFileName,
-        status: "completed",
-        transcript: transcript
-      })
-      .eq("id", programId);
-
-    if (dbError) {
-
-      console.error("DB update error:", dbError);
-
-      return res.status(500).json({ error: "Database update failed" });
-
-    }
-
-    console.log("Supabase updated successfully");
-
-    /*
-    =========================
-    FINAL RESPONSE
-    =========================
-    */
-
-    res.json({
-      success: true,
-      videoUrl: publicUrl,
-      summary: summaryText,
-      description: descriptionText,
-      transcript: transcript,
-      keywords: aiKeywords.length ? aiKeywords : keywords
-    });
-
-  }
-
-  catch (error) {
-
-    console.error("Conversion error:", error);
-
-    res.status(500).json({ error: "Conversion failed" });
-
-  }
+index++;
 
 });
 
-const PORT = process.env.PORT || 8080;
+}
 
-app.listen(PORT, () => {
+console.log("Subtitles ready");
 
-  console.log(`Server running on port ${PORT}`);
+const subtitlePath="/tmp/subtitles.srt";
+fs.writeFileSync(subtitlePath,srt);
 
+/*
+STEP 2 — Background image
+*/
+
+const backgroundImage="./assets/radio_background.jpg";
+
+/*
+STEP 3 — FFmpeg render
+*/
+
+await new Promise((resolve,reject)=>{
+
+const ffmpeg=spawn("ffmpeg",[
+"-y",
+"-loop","1",
+"-i",backgroundImage,
+"-i",inputPath,
+"-vf",`scale=1280:720,subtitles=${subtitlePath}:force_style='Fontsize=26,PrimaryColour=&Hffffff&,OutlineColour=&H000000&,BorderStyle=3'`,
+"-c:v","libx264",
+"-preset","veryfast",
+"-c:a","aac",
+"-shortest",
+outputPath
+]);
+
+ffmpeg.stderr.on("data",(data)=>{
+console.log(`ffmpeg: ${data}`);
+});
+
+ffmpeg.on("close",(code)=>{
+if(code===0) resolve();
+else reject(new Error(`FFmpeg exited with code ${code}`));
+});
+
+});
+
+console.log("FFmpeg completed");
+
+/*
+STEP 4 — Upload video
+*/
+
+const videoBuffer=fs.readFileSync(outputPath);
+
+const {error:uploadError}=await supabase.storage
+.from("video-files")
+.upload(videoFileName,videoBuffer,{
+contentType:"video/mp4",
+upsert:true
+});
+
+if(uploadError){
+console.error("Upload error:",uploadError);
+return res.status(500).json({error:"Storage upload failed"});
+}
+
+const {data}=supabase.storage
+.from("video-files")
+.getPublicUrl(videoFileName);
+
+const publicUrl=data.publicUrl;
+
+/*
+STEP 5 — Update database
+*/
+
+const {error:dbError}=await supabase
+.from("programs")
+.update({
+mp4_path:videoFileName,
+status:"completed",
+transcript:transcript
+})
+.eq("id",programId);
+
+if(dbError){
+console.error("DB update error:",dbError);
+return res.status(500).json({error:"Database update failed"});
+}
+
+console.log("Supabase updated successfully");
+
+/*
+FINAL RESPONSE
+*/
+
+res.json({
+success:true,
+videoUrl:publicUrl,
+summary:summaryText,
+description:descriptionText,
+transcript:transcript,
+keywords:aiKeywords.length?aiKeywords:keywords
+});
+
+}
+
+catch(error){
+
+console.error("Conversion error:",error);
+
+res.status(500).json({error:"Conversion failed"});
+
+}
+
+});
+
+const PORT=process.env.PORT||8080;
+
+app.listen(PORT,()=>{
+console.log(`Server running on port ${PORT}`);
 });
