@@ -1,5 +1,6 @@
 import express from "express";
 import fs from "fs";
+import path from "path";
 import { spawn } from "child_process";
 import { createClient } from "@supabase/supabase-js";
 import cors from "cors";
@@ -8,11 +9,33 @@ import { GoogleGenAI } from "@google/genai";
 
 const app = express();
 
-const genAI = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-});
+/**
+ * =========
+ * ENV
+ * =========
+ * GEMINI_API_KEY
+ * PUBLIC_SUPABASE_URL
+ * SUPABASE_SERVICE_ROLE_KEY
+ *
+ * Optional speed knobs:
+ * FAST_MODE=true                -> trims audio for Gemini + video render (for dev testing)
+ * FAST_MODE_SECONDS=180         -> how many seconds to process when FAST_MODE=true
+ * GEMINI_AUDIO_SECONDS=600      -> even in normal mode, only send first N seconds to Gemini (faster + cheaper)
+ */
 
-const upload = multer({ dest: "/tmp" });
+const FAST_MODE = String(process.env.FAST_MODE || "false").toLowerCase() === "true";
+const FAST_MODE_SECONDS = Number(process.env.FAST_MODE_SECONDS || 180); // 3 mins
+const GEMINI_AUDIO_SECONDS = Number(process.env.GEMINI_AUDIO_SECONDS || 600); // 10 mins
+
+const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+const upload = multer({
+  dest: "/tmp",
+  limits: {
+    // 20min mp3 at 128kbps ~= ~19MB; but uploads could be wav/webm etc, so allow bigger
+    fileSize: 250 * 1024 * 1024, // 250MB
+  },
+});
 
 app.use(
   cors({
@@ -22,7 +45,7 @@ app.use(
   })
 );
 
-// make sure preflight always succeeds
+// Preflight always succeeds
 app.options("*", cors());
 
 app.use(express.json());
@@ -33,19 +56,39 @@ const supabase = createClient(
 );
 
 /**
+ * =========
  * Helpers
+ * =========
  */
+
+function nowMs() {
+  return Date.now();
+}
+
+function safeUnlink(p) {
+  try {
+    fs.unlinkSync(p);
+  } catch (_) {}
+}
+
 function stripCodeFences(text = "") {
-  // Removes ```json ... ``` or ``` ... ```
-  return text
+  return String(text)
     .trim()
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/```$/i, "")
     .trim();
 }
 
+// If Gemini returns extra text before/after JSON, extract first {...} block
+function extractFirstJsonObject(text = "") {
+  const s = String(text);
+  const start = s.indexOf("{");
+  const end = s.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+  return s.slice(start, end + 1);
+}
+
 function isLikelySrt(s = "") {
-  // quick sanity check
   return (
     typeof s === "string" &&
     s.includes("-->") &&
@@ -71,8 +114,7 @@ function formatSrtTime(sec) {
   return `${h}:${m}:${s},${String(ms).padStart(3, "0")}`;
 }
 
-function splitTranscriptToCaptions(transcript, maxChars = 70) {
-  // Split into sentence-ish chunks, then wrap to maxChars
+function splitTranscriptToCaptions(transcript, maxChars = 72) {
   const flat = String(transcript || "")
     .replace(/\r/g, "")
     .replace(/\n+/g, " ")
@@ -87,7 +129,6 @@ function splitTranscriptToCaptions(transcript, maxChars = 70) {
 
   const chunks = [];
   for (const s of sentences.length ? sentences : [flat]) {
-    // soft wrap long sentences
     if (s.length <= maxChars) {
       chunks.push(s);
       continue;
@@ -108,7 +149,6 @@ function splitTranscriptToCaptions(transcript, maxChars = 70) {
 }
 
 async function ffprobeDurationSeconds(inputPath) {
-  // Uses ffprobe to read duration; ffprobe usually ships with ffmpeg
   return await new Promise((resolve) => {
     const args = [
       "-v",
@@ -130,16 +170,20 @@ async function ffprobeDurationSeconds(inputPath) {
   });
 }
 
+/**
+ * Much better fallback than "3 seconds per line":
+ * distributes caption times across full duration proportional to word counts,
+ * with sensible min/max per caption so it doesn't dump everything early.
+ */
 function buildSrtProportional(transcript, durationSec) {
-  // Build SRT by distributing times proportional to word counts across captions
   const captions = splitTranscriptToCaptions(transcript, 72);
   if (!captions.length) return "";
 
   const wordsPerCaption = captions.map((c) => c.split(/\s+/).filter(Boolean).length);
   const totalWords = wordsPerCaption.reduce((a, b) => a + b, 0) || captions.length;
 
-  // If duration unknown, fallback to ~3s per caption
-  const totalDuration = Number.isFinite(durationSec) && durationSec > 0 ? durationSec : captions.length * 3;
+  const totalDuration =
+    Number.isFinite(durationSec) && durationSec > 0 ? durationSec : captions.length * 3;
 
   let t = 0;
   let idx = 1;
@@ -147,9 +191,10 @@ function buildSrtProportional(transcript, durationSec) {
 
   for (let i = 0; i < captions.length; i++) {
     const w = wordsPerCaption[i] || 1;
-    // Minimum 1.8s, maximum 6.0s per caption (keeps them readable)
+
+    // readable cadence
     const raw = (w / totalWords) * totalDuration;
-    const dur = Math.min(6.0, Math.max(1.8, raw));
+    const dur = Math.min(6.0, Math.max(1.6, raw));
 
     const start = t;
     const end = Math.min(totalDuration, t + dur);
@@ -158,48 +203,137 @@ function buildSrtProportional(transcript, durationSec) {
 
     idx++;
     t = end;
-
     if (t >= totalDuration - 0.05) break;
   }
 
   return srt.trim() + "\n";
 }
 
-function safeUnlink(path) {
-  try {
-    fs.unlinkSync(path);
-  } catch (_) {}
+async function runFfmpeg(args, logPrefix = "ffmpeg") {
+  return await new Promise((resolve, reject) => {
+    const p = spawn("ffmpeg", args);
+
+    p.stderr.on("data", (data) => {
+      console.log(`${logPrefix}: ${data.toString()}`);
+    });
+
+    p.on("error", reject);
+
+    p.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`FFmpeg exited with code ${code}`));
+    });
+  });
+}
+
+/**
+ * Ensure we have a Gemini-friendly audio file:
+ * - Convert whatever upload is (wav/webm/m4a/etc) to mp3
+ * - Optionally trim to N seconds (FAST_MODE for dev speed)
+ * - Optionally trim only for Gemini (GEMINI_AUDIO_SECONDS)
+ */
+async function transcodeToMp3(inputPath, outPath) {
+  // -vn ensures no video track; -ar 44100 stable
+  await runFfmpeg(
+    [
+      "-y",
+      "-i",
+      inputPath,
+      "-vn",
+      "-ac",
+      "2",
+      "-ar",
+      "44100",
+      "-b:a",
+      "128k",
+      outPath,
+    ],
+    "ffmpeg(transcode)"
+  );
+}
+
+async function trimAudio(inputPath, outPath, seconds) {
+  await runFfmpeg(
+    [
+      "-y",
+      "-i",
+      inputPath,
+      "-t",
+      String(seconds),
+      "-c",
+      "copy",
+      outPath,
+    ],
+    "ffmpeg(trim)"
+  );
 }
 
 app.post("/convert", upload.single("audio"), async (req, res) => {
-  const startedAt = Date.now();
+  const startedAt = nowMs();
+
+  // Track temp files so we can clean up
+  const tmp = [];
 
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: "No audio file uploaded" });
-    }
+    if (!req.file) return res.status(400).json({ error: "No audio file uploaded" });
 
     const keywords = JSON.parse(req.body.keywords || "[]");
     const programId = req.body.programId;
-
-    if (!programId) {
-      return res.status(400).json({ error: "Missing programId" });
-    }
+    if (!programId) return res.status(400).json({ error: "Missing programId" });
 
     const inputPath = req.file.path;
-    const outputPath = `/tmp/output-${Date.now()}.mp4`;
-    const subtitlePath = `/tmp/subtitles-${Date.now()}.srt`;
-    const videoFileName = `video-${Date.now()}.mp4`;
+    tmp.push(inputPath);
 
-    console.log("Audio received:", inputPath);
+    console.log("Audio received:", inputPath, "mimetype:", req.file.mimetype);
 
-    /*
-      STEP 1 — Send audio to Gemini (JSON only)
-      We ASK for transcript + srt + summary + description + keywords.
-      If Gemini doesn't produce valid JSON or SRT, we fallback to duration-based SRT.
-    */
-    const audioData = fs.readFileSync(inputPath).toString("base64");
-    const mimeType = req.file.mimetype || "audio/mpeg";
+    /**
+     * =========
+     * STEP A — Normalize audio to MP3 (important for Gemini reliability)
+     * =========
+     */
+    const mp3Path = `/tmp/audio-${Date.now()}.mp3`;
+    tmp.push(mp3Path);
+
+    // Always transcode -> consistent + fixes weird upload formats
+    await transcodeToMp3(inputPath, mp3Path);
+
+    /**
+     * =========
+     * STEP B — FAST MODE (dev) and GEMINI trimming (speed)
+     * =========
+     * FAST_MODE:
+     *   - trims BOTH Gemini + video render (super fast end-to-end testing)
+     * GEMINI_AUDIO_SECONDS:
+     *   - even in non-fast mode, only send first N seconds to Gemini to reduce AI time/cost
+     *   - subtitles then get proportionally distributed across full duration (fallback)
+     */
+    let mp3ForGemini = mp3Path;
+
+    if (FAST_MODE) {
+      const trimmed = `/tmp/audio-fast-${Date.now()}.mp3`;
+      tmp.push(trimmed);
+      await trimAudio(mp3Path, trimmed, FAST_MODE_SECONDS);
+      mp3ForGemini = trimmed;
+      console.log(`FAST_MODE enabled: processing only first ${FAST_MODE_SECONDS}s`);
+    } else if (GEMINI_AUDIO_SECONDS > 0) {
+      const dur = await ffprobeDurationSeconds(mp3Path);
+      if (dur && dur > GEMINI_AUDIO_SECONDS + 5) {
+        const trimmed = `/tmp/audio-gemini-${Date.now()}.mp3`;
+        tmp.push(trimmed);
+        await trimAudio(mp3Path, trimmed, GEMINI_AUDIO_SECONDS);
+        mp3ForGemini = trimmed;
+        console.log(
+          `Gemini audio trimmed to ${GEMINI_AUDIO_SECONDS}s (full duration ~${Math.round(dur)}s)`
+        );
+      }
+    }
+
+    /**
+     * =========
+     * STEP 1 — Gemini: transcript + srt + summary + description + keywords
+     * =========
+     */
+    const audioBase64 = fs.readFileSync(mp3ForGemini).toString("base64");
 
     const aiResponse = await genAI.models.generateContent({
       model: "gemini-2.5-flash",
@@ -229,8 +363,8 @@ Rules:
             },
             {
               inlineData: {
-                mimeType,
-                data: audioData,
+                mimeType: "audio/mp3",
+                data: audioBase64,
               },
             },
           ],
@@ -245,74 +379,83 @@ Rules:
     let descriptionText = "";
     let aiKeywords = [];
     let srt = "";
-
-    // Try parse JSON (handle occasional code fences)
-    const rawText = stripCodeFences(aiResponse?.text || "");
     let parsedOk = false;
 
+    const rawText = stripCodeFences(aiResponse?.text || "");
+    const rawJson = extractFirstJsonObject(rawText) || rawText;
+
     try {
-      const aiData = JSON.parse(rawText);
+      const aiData = JSON.parse(rawJson);
       transcript = String(aiData.transcript || "").trim();
       summaryText = String(aiData.summary || "").trim();
       descriptionText = String(aiData.description || "").trim();
       aiKeywords = clampKeywords(aiData.keywords).slice(0, 10);
       srt = String(aiData.srt || "").trim();
       parsedOk = true;
-    } catch (err) {
+    } catch (_) {
       parsedOk = false;
     }
 
-    // Validate SRT; if missing/invalid, build a better fallback based on audio duration
-    if (!transcript) {
-      // If transcript missing, fallback to whatever Gemini returned as text
-      transcript = rawText || "";
-    }
+    // Ensure transcript exists
+    if (!transcript) transcript = rawText || "";
 
+    // Validate / fallback SRT
     if (!isLikelySrt(srt)) {
       console.log("SRT invalid or missing; building fallback SRT from duration...");
-      const durationSec = await ffprobeDurationSeconds(inputPath);
+      const durationSec = await ffprobeDurationSeconds(mp3Path); // full duration
       srt = buildSrtProportional(transcript, durationSec);
     }
 
-    // If summary/description missing, create minimal safe fallbacks (keeps UI from spinning)
+    // Ensure summary/description exists so UI doesn't spin forever
     if (!summaryText) {
       summaryText = transcript
-        ? transcript.split(/\s+/).slice(0, 35).join(" ") + "…"
+        ? transcript.split(/\s+/).slice(0, 40).join(" ") + "…"
         : "Summary unavailable.";
     }
+
     if (!descriptionText) {
-      descriptionText =
-        "🎙️ New broadcast clip\n\nGenerated from the uploaded radio audio.\n\n#radio #podcast";
+      descriptionText = "🎙️ New broadcast clip\n\nGenerated from the uploaded radio audio.\n\n#radio #podcast";
     }
 
-    // Merge keywords: AI keywords preferred, else use user-provided, and always de-dup
+    // Merge keywords: AI first, then user keywords
     const mergedKeywords = clampKeywords(
-      (aiKeywords && aiKeywords.length ? aiKeywords : []).concat(keywords || [])
+      (aiKeywords?.length ? aiKeywords : []).concat(keywords || [])
     ).slice(0, 25);
 
-    console.log("Subtitles ready");
-
+    /**
+     * =========
+     * STEP 2 — Write subtitles to disk
+     * =========
+     */
+    const subtitlePath = `/tmp/subtitles-${Date.now()}.srt`;
+    tmp.push(subtitlePath);
     fs.writeFileSync(subtitlePath, srt);
 
-    /*
-      STEP 2 — Background image
-    */
+    /**
+     * =========
+     * STEP 3 — Render MP4 with FFmpeg
+     * =========
+     * Speed-focused flags:
+     * -preset ultrafast
+     * -crf 30 (smaller / faster)
+     * -tune stillimage (best for static background)
+     * -movflags +faststart (download/play sooner)
+     * -threads 2 (match your Cloud Run CPU if 2 vCPU)
+     */
     const backgroundImage = "./assets/radio_background.jpg";
 
-    /*
-      STEP 3 — FFmpeg render
-      - We scale to 1280x720
-      - Force even dimensions (libx264 requirement) by scaling to exact 1280x720
-      - Burn subtitles with readable style
-    */
-    await new Promise((resolve, reject) => {
-      const vf = [
-        "scale=1280:720",
-        // Burn subtitles
-        `subtitles=${subtitlePath}:force_style=` +
-          `'Fontsize=30,PrimaryColour=&H00FFFFFF&,OutlineColour=&H00000000&,BorderStyle=3,Outline=2,Shadow=1,MarginV=40'`,
-      ].join(",");
+    const outputPath = `/tmp/output-${Date.now()}.mp4`;
+    tmp.push(outputPath);
 
+    // In FAST_MODE we also trim the video render to the same duration (quick dev cycle)
+    const renderAudioPath = FAST_MODE ? mp3ForGemini : mp3Path;
+
+    const vf =
+      "scale=1280:720," +
+      `subtitles=${subtitlePath}:force_style=` +
+      `'Fontsize=30,PrimaryColour=&H00FFFFFF&,OutlineColour=&H00000000&,BorderStyle=3,Outline=2,Shadow=1,MarginV=40'`;
+
+    await new Promise((resolve, reject) => {
       const ffmpeg = spawn("ffmpeg", [
         "-y",
         "-loop",
@@ -320,28 +463,38 @@ Rules:
         "-i",
         backgroundImage,
         "-i",
-        inputPath,
+        renderAudioPath,
+
         "-vf",
         vf,
+
         "-c:v",
         "libx264",
         "-preset",
-        "veryfast",
+        "ultrafast",
+        "-tune",
+        "stillimage",
+        "-crf",
+        "30",
         "-pix_fmt",
         "yuv420p",
+        "-threads",
+        "2",
+
         "-c:a",
         "aac",
+        "-b:a",
+        "128k",
+
         "-shortest",
+        "-movflags",
+        "+faststart",
+
         outputPath,
       ]);
 
-      ffmpeg.stderr.on("data", (data) => {
-        // keep streaming logs (prevents maxBuffer crash)
-        console.log(`ffmpeg: ${data.toString()}`);
-      });
-
+      ffmpeg.stderr.on("data", (data) => console.log(`ffmpeg: ${data.toString()}`));
       ffmpeg.on("error", reject);
-
       ffmpeg.on("close", (code) => {
         if (code === 0) resolve();
         else reject(new Error(`FFmpeg exited with code ${code}`));
@@ -350,9 +503,14 @@ Rules:
 
     console.log("FFmpeg completed");
 
-    /*
-      STEP 4 — Upload video
-    */
+    /**
+     * =========
+     * STEP 4 — Upload video to Supabase Storage
+     * =========
+     * NOTE: This reads file into memory. For very large files (longer than 20min),
+     * you'll eventually want signed upload URLs or chunked upload.
+     */
+    const videoFileName = `video-${Date.now()}.mp4`;
     const videoBuffer = fs.readFileSync(outputPath);
 
     const { error: uploadError } = await supabase.storage
@@ -370,17 +528,20 @@ Rules:
     const { data } = supabase.storage.from("video-files").getPublicUrl(videoFileName);
     const publicUrl = data.publicUrl;
 
-    /*
-      STEP 5 — Update database
-      (Include summary/description/keywords if your table has these columns)
-    */
+    /**
+     * =========
+     * STEP 5 — Update DB
+     * =========
+     * Only include columns that exist in your table schema.
+     * If programs.keywords is NOT jsonb/text[], remove it here.
+     */
     const updatePayload = {
       mp4_path: videoFileName,
       status: "completed",
-      transcript: transcript,
+      transcript,
       summary: summaryText,
       description: descriptionText,
-      keywords: mergedKeywords, // if column is jsonb/text[] this is OK
+      keywords: mergedKeywords,
     };
 
     const { error: dbError } = await supabase
@@ -395,36 +556,44 @@ Rules:
 
     console.log("Supabase updated successfully");
 
-    /*
-      Cleanup temp files (Cloud Run /tmp is limited)
-    */
-    safeUnlink(outputPath);
-    safeUnlink(subtitlePath);
-    safeUnlink(inputPath);
-
-    /*
-      FINAL RESPONSE (frontend expects these exact keys)
-    */
+    /**
+     * =========
+     * FINAL RESPONSE
+     * =========
+     */
     res.json({
       success: true,
       videoUrl: publicUrl,
       summary: summaryText,
       description: descriptionText,
-      transcript: transcript,
+      transcript,
       keywords: mergedKeywords,
       meta: {
         parsedOk,
-        ms: Date.now() - startedAt,
+        fastMode: FAST_MODE,
+        geminiSeconds: FAST_MODE ? FAST_MODE_SECONDS : GEMINI_AUDIO_SECONDS,
+        ms: nowMs() - startedAt,
       },
     });
   } catch (error) {
     console.error("Conversion error:", error);
     res.status(500).json({ error: "Conversion failed" });
+  } finally {
+    // Clean up temp files (Cloud Run /tmp is small)
+    // Keep logs readable and avoid storage bloat between requests.
+    // (If debugging, comment this out temporarily)
+    // eslint-disable-next-line no-unused-vars
+    // tmp.forEach(safeUnlink);
+    try {
+      // safer: only delete files that exist
+      // (comment out if you want to inspect /tmp in debugging)
+      // tmp.forEach(safeUnlink);
+
+      // By default keep cleanup ON:
+      tmp.forEach(safeUnlink);
+    } catch (_) {}
   }
 });
 
 const PORT = process.env.PORT || 8080;
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
