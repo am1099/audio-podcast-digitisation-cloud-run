@@ -73,13 +73,20 @@ app.post("/convert", upload.single("audio"), async (req, res) => {
 
     const publicUrl = publicUrlData.publicUrl;
 
+    const { programId } = req.body;
+
+    if (!programId) {
+      return res.status(400).json({ error: "Missing programId" });
+    }
+
     // 🔹 Update DB
     const { error: dbError } = await supabase
       .from("programs")
-      .insert({
+      .update({
         mp4_path: videoFileName,
         status: "completed",
-      });
+      })
+      .eq("id", programId);
 
 if (dbError) {
   console.error("DB insert error:", dbError);
