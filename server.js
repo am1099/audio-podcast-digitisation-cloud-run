@@ -413,23 +413,37 @@ app.post("/convert", upload.single("audio"), async (req, res) => {
 
     const rawText = stripCodeFences(aiResponse?.text || "");
 
-    let rawJson = extractFirstJsonObject(rawText);
+    let parsed;
     
-    if (!rawJson) {
-      console.warn("Gemini JSON not detected, using raw response");
-      rawJson = rawText;
-    }
-
     try {
-      const aiData = JSON.parse(rawJson);
-      transcript = String(aiData.transcript || "").trim();
-      summaryText = String(aiData.summary || "").trim();
-      descriptionText = String(aiData.description || "").trim();
-      aiKeywords = clampKeywords(aiData.keywords).slice(0, 10);
-      srt = String(aiData.srt || "").trim();
+    
+      const json = extractFirstJsonObject(rawText);
+    
+      if (json) {
+        parsed = JSON.parse(json);
+      } else {
+        parsed = JSON.parse(rawText);
+      }
+    
+    } catch (err) {
+      console.error("Gemini JSON parsing failed:", err);
+    }
+    
+    if (parsed) {
+    
+      transcript = String(parsed.transcript || "").trim();
+      summaryText = String(parsed.summary || "").trim();
+      descriptionText = String(parsed.description || "").trim();
+      aiKeywords = clampKeywords(parsed.keywords || []).slice(0, 10);
+      srt = String(parsed.srt || "").trim();
+    
       parsedOk = true;
-    } catch (_) {
+    
+    } else {
+    
       parsedOk = false;
+      transcript = "Transcript unavailable.";
+    
     }
 
     // Ensure transcript exists
@@ -439,11 +453,8 @@ app.post("/convert", upload.single("audio"), async (req, res) => {
     }
 
     // Validate / fallback SRT
-    if (!srt || !isLikelySrt(srt) || srt.length < 100) {
-      console.log("SRT invalid or missing; building fallback SRT from duration...");
-      const durationSec = await ffprobeDurationSeconds(mp3Path); // full duration
-      srt = buildSrtProportional(transcript, durationSec);
-    }
+    const durationSec = await ffprobeDurationSeconds(mp3Path);
+    srt = buildSrtProportional(transcript, durationSec);
 
     // Ensure summary/description exists so UI doesn't spin forever
     if (!summaryText) {
@@ -602,8 +613,9 @@ app.post("/convert", upload.single("audio"), async (req, res) => {
      * =========
      */
 
-    summaryText = summaryText || "Summary unavailable.";
-    descriptionText = descriptionText || "Generated radio broadcast clip.";
+    summaryText = summaryText || "";
+    descriptionText = descriptionText || "";
+    transcript = transcript || "";
     
     res.json({
       success: true,
