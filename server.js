@@ -118,27 +118,42 @@ app.post("/convert", upload.single("audio"), async (req, res) => {
 
     const imagePrompt = `
     Create a cinematic radio broadcast background.
-
+    
     Topic keywords:
     ${keywords.join(", ")}
-
+    
     Style:
     modern podcast studio
     dark cinematic lighting
     professional broadcast graphics
-    resolution 1280x720
+    1280x720 resolution
     `;
-
+    
     console.log("Image prompt:", imagePrompt);
+    
+    const backgroundImage = "/tmp/background.png";
 
-    /*
-    NOTE:
-    Gemini text models cannot generate images directly.
-    For now we use a static background.
-    Later we will plug Imagen here.
-    */
+/*
+Generate image with Imagen
+*/
 
-    const backgroundImage = "/app/assets/radio_background.jpg";
+const imageResponse = await genAI.models.generateImages({
+  model: "imagen-3.0-generate-001",
+  prompt: imagePrompt,
+  config: {
+    numberOfImages: 1,
+    aspectRatio: "16:9"
+  }
+});
+
+const imageBase64 = imageResponse.generatedImages[0].image.imageBytes;
+
+fs.writeFileSync(
+  backgroundImage,
+  Buffer.from(imageBase64, "base64")
+);
+
+console.log("AI background image created:", backgroundImage);
 
     /*
     =========================
