@@ -185,34 +185,42 @@ async function ffprobeDurationSeconds(inputPath) {
  * with sensible min/max per caption so it doesn't dump everything early.
  */
 function buildSrtProportional(transcript, durationSec) {
-  const captions = splitTranscriptToCaptions(transcript, 72);
+
+  const captions = splitTranscriptToCaptions(transcript, 70);
   if (!captions.length) return "";
 
-  const wordsPerCaption = captions.map((c) => c.split(/\s+/).filter(Boolean).length);
-  const totalWords = wordsPerCaption.reduce((a, b) => a + b, 0) || captions.length;
+  const words = captions.map(c => c.split(/\s+/).length);
+  const totalWords = words.reduce((a,b)=>a+b,0);
 
   const totalDuration =
-    Number.isFinite(durationSec) && durationSec > 0 ? durationSec : captions.length * 3;
+    Number.isFinite(durationSec) && durationSec > 0
+      ? durationSec
+      : captions.length * 3;
 
-  let t = 0;
-  let idx = 1;
+  let currentTime = 0;
+  let index = 1;
   let srt = "";
 
   for (let i = 0; i < captions.length; i++) {
-    const w = wordsPerCaption[i] || 1;
 
-    // readable cadence
-    const raw = (w / totalWords) * totalDuration;
-    const dur = Math.min(6.0, Math.max(1.6, raw));
+    const proportion = words[i] / totalWords;
+    let dur = proportion * totalDuration;
 
-    const start = t;
-    const end = Math.min(totalDuration, t + dur);
+    dur = Math.min(6, Math.max(1.8, dur));
 
-    srt += `${idx}\n${formatSrtTime(start)} --> ${formatSrtTime(end)}\n${captions[i]}\n\n`;
+    const start = currentTime;
+    const end = Math.min(totalDuration, start + dur);
 
-    idx++;
-    t = end;
-    if (t >= totalDuration - 0.05) break;
+    srt += `${index}
+${formatSrtTime(start)} --> ${formatSrtTime(end)}
+${captions[i]}
+
+`;
+
+    index++;
+    currentTime = end;
+
+    if (currentTime >= totalDuration - 0.2) break;
   }
 
   return srt.trim() + "\n";
@@ -352,23 +360,34 @@ app.post("/convert", upload.single("audio"), async (req, res) => {
           parts: [
             {
               text: `
-You are processing a radio broadcast audio file.
-
-Return ONLY valid JSON (no markdown, no backticks, no extra text):
-
-{
-  "transcript": "plain text transcript with paragraphs (NO timestamps)",
-  "srt": "valid .srt subtitles WITH timestamps in correct SRT format",
-  "summary": "2-3 sentence summary",
-  "description": "YouTube-style description with emojis and a few hashtags at the end",
-  "keywords": ["10", "SEO", "keywords", "as", "strings"]
-}
-
-Rules:
-- transcript: plain readable text, no SRT lines, no timestamps.
-- srt: must be valid SRT timing format HH:MM:SS,mmm --> HH:MM:SS,mmm
-- keywords: 10 items max
-              `.trim(),
+    You are processing a RADIO broadcast audio file.
+    
+    The audio may contain:
+    - Arabic
+    - Algerian dialect
+    - Quran verses
+    - Hadith
+    - Islamic lectures
+    
+    Your job is to TRANSCRIBE accurately.
+    
+    Return ONLY valid JSON (no markdown, no explanation):
+    
+    {
+      "transcript": "full transcript in original language with paragraphs",
+      "srt": "valid SRT subtitles with timestamps",
+      "summary": "2-3 sentence summary",
+      "description": "YouTube style description with emojis and hashtags",
+      "keywords": ["10 SEO keywords"]
+    }
+    
+    Rules:
+    - transcript must NOT contain timestamps
+    - transcript must preserve Arabic text exactly
+    - srt timestamps MUST follow format: HH:MM:SS,mmm --> HH:MM:SS,mmm
+    - subtitles should contain 5–12 words each
+    - keywords must be strings only
+    `.trim(),
             },
             {
               inlineData: {
@@ -383,6 +402,8 @@ Rules:
 
     console.log("Gemini response received");
 
+    console.log("Gemini processing took", nowMs() - startedAt, "ms");
+
     let transcript = "";
     let summaryText = "";
     let descriptionText = "";
@@ -391,7 +412,13 @@ Rules:
     let parsedOk = false;
 
     const rawText = stripCodeFences(aiResponse?.text || "");
-    const rawJson = extractFirstJsonObject(rawText) || rawText;
+
+    let rawJson = extractFirstJsonObject(rawText);
+    
+    if (!rawJson) {
+      console.warn("Gemini JSON not detected, using raw response");
+      rawJson = rawText;
+    }
 
     try {
       const aiData = JSON.parse(rawJson);
@@ -406,10 +433,13 @@ Rules:
     }
 
     // Ensure transcript exists
-    if (!transcript) transcript = rawText || "";
+    if (!transcript || transcript.length < 30) {
+      console.warn("Transcript missing or too short, falling back to raw Gemini text");
+      transcript = rawText || "Transcript unavailable.";
+    }
 
     // Validate / fallback SRT
-    if (!isLikelySrt(srt)) {
+    if (!srt || !isLikelySrt(srt) || srt.length < 100) {
       console.log("SRT invalid or missing; building fallback SRT from duration...");
       const durationSec = await ffprobeDurationSeconds(mp3Path); // full duration
       srt = buildSrtProportional(transcript, durationSec);
@@ -427,9 +457,10 @@ Rules:
     }
 
     // Merge keywords: AI first, then user keywords
-    const mergedKeywords = clampKeywords(
-      (aiKeywords?.length ? aiKeywords : []).concat(keywords || [])
-    ).slice(0, 25);
+    const mergedKeywords = clampKeywords([
+      ...(aiKeywords || []),
+      ...(keywords || [])
+    ]).slice(0, 15);
 
     /**
      * =========
@@ -570,6 +601,10 @@ Rules:
      * FINAL RESPONSE
      * =========
      */
+
+    summaryText = summaryText || "Summary unavailable.";
+    descriptionText = descriptionText || "Generated radio broadcast clip.";
+    
     res.json({
       success: true,
       videoUrl: publicUrl,
