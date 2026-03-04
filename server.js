@@ -178,7 +178,7 @@ app.post("/convert", upload.single("audio"), async (req, res) => {
         "-loop", "1",
         "-i", backgroundImage,
         "-i", inputPath,
-        "-vf", `subtitles=${subtitlePath}`,
+        "-vf", `scale=1280:720,subtitles=${subtitlePath}`,
         "-c:v", "libx264",
         "-c:a", "aac",
         "-shortest",
