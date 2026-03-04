@@ -135,33 +135,35 @@ app.post("/convert", upload.single("audio"), async (req, res) => {
     /*
     Use Unsplash random image API
     */
+
+    const backgroundImage = "./assets/radio_background.jpg";
     
-    const query = encodeURIComponent(keywords.join(" "));
-    const imageUrl = `https://source.unsplash.com/1280x720/?${query},podcast,studio`;
+    // const query = encodeURIComponent(keywords.join(" "));
+    // const imageUrl = `https://source.unsplash.com/1280x720/?${query},podcast,studio`;
     
-    const backgroundImage = "/tmp/background.jpg";
+    // const backgroundImage = "/tmp/background.jpg";
     
-    await new Promise((resolve, reject) => {
+    // await new Promise((resolve, reject) => {
     
-      const file = fs.createWriteStream(backgroundImage);
+    //   const file = fs.createWriteStream(backgroundImage);
     
-      https.get(imageUrl, (response) => {
+    //   https.get(imageUrl, (response) => {
     
-        response.pipe(file);
+    //     response.pipe(file);
     
-        file.on("finish", () => {
-          file.close(resolve);
-        });
+    //     file.on("finish", () => {
+    //       file.close(resolve);
+    //     });
     
-      }).on("error", (err) => {
+    //   }).on("error", (err) => {
     
-        fs.unlink(backgroundImage, () => reject(err));
+    //     fs.unlink(backgroundImage, () => reject(err));
     
-      });
+    //   });
     
-    });
+    // });
     
-    console.log("Background image downloaded");
+    // console.log("Background image downloaded");
 
     /*
     =========================
