@@ -4,11 +4,12 @@ import { exec } from "child_process";
 import { createClient } from "@supabase/supabase-js";
 import cors from "cors";
 import multer from "multer";
-import { GoogleGenerativeAI } from "@google/generative-ai";
-
+import { GoogleGenAI } from "@google/genai";
 const app = express();
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const genAI = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY
+});
 
 const upload = multer({ dest: "/tmp" });
 
@@ -54,26 +55,27 @@ app.post("/convert", upload.single("audio"), async (req, res) => {
     =========================
     */
 
-    const transcriptionModel = genAI.getGenerativeModel({
-      model: "gemini-1.5-flash"
-    });
+    const audioData = fs.readFileSync(inputPath).toString("base64");
 
-    const transcriptionPrompt = `
-    Transcribe the following radio broadcast audio.
-    Return plain text.
-    `;
-
-    const transcriptionResult = await transcriptionModel.generateContent([
-      transcriptionPrompt,
-      {
-        inlineData: {
-          mimeType: "audio/mp3",
-          data: fs.readFileSync(inputPath).toString("base64")
+    const response = await genAI.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { text: "Transcribe this radio broadcast audio." },
+            {
+              inlineData: {
+                mimeType: "audio/mp3",
+                data: audioData
+              }
+            }
+          ]
         }
-      }
-    ]);
-
-    const transcript = transcriptionResult.response.text();
+      ]
+    });
+    
+    const transcript = response.text;
 
     console.log("Transcript generated");
 
