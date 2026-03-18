@@ -162,20 +162,26 @@ app.post("/convert", upload.single("audio"), async (req, res) => {
       mp3Path
     ], "ffmpeg(transcode)");
 
-    /**
-     * =========
-     * STEP 1 — Gemini (SAFE)
-     * =========
-     */
-    const audioBase64 = fs.readFileSync(mp3Path).toString("base64");
+    // ONLY SHOWING THE FIXED SECTION — REPLACE YOUR STEP 1 BLOCK
 
-    const aiResponse = await callGeminiSafe({
-      model: "gemini-2.5-flash",
-      contents: [{
-        role: "user",
-        parts: [
-          {
-            text: `
+/**
+ * =========
+ * STEP 1 — Gemini (SAFE + FULLY PROTECTED)
+ * =========
+ */
+
+const audioBase64 = fs.readFileSync(mp3Path).toString("base64");
+
+let aiResponse = null;
+
+try {
+  aiResponse = await callGeminiSafe({
+    model: "gemini-2.5-flash",
+    contents: [{
+      role: "user",
+      parts: [
+        {
+          text: `
 Return ONLY JSON:
 {
   "transcript": "...",
@@ -183,49 +189,59 @@ Return ONLY JSON:
   "description": "...",
   "keywords": []
 }
-            `
-          },
-          {
-            inlineData: {
-              mimeType: "audio/mp3",
-              data: audioBase64
-            }
+          `
+        },
+        {
+          inlineData: {
+            mimeType: "audio/mp3",
+            data: audioBase64
           }
-        ]
-      }]
-    });
+        }
+      ]
+    }]
+  });
+} catch (err) {
+  console.error("Gemini crashed completely:", err);
+}
 
-    let transcript = "";
-    let summaryText = "";
-    let descriptionText = "";
-    let keywords = [];
-    let parsedOk = false;
+let transcript = "";
+let summaryText = "";
+let descriptionText = "";
+let keywords = [];
+let parsedOk = false;
 
-    if (aiResponse) {
+if (!aiResponse) {
 
-      const rawText = stripCodeFences(aiResponse.text);
+  console.log("Gemini failed — fallback used");
 
-      try {
-        const parsed = JSON.parse(extractFirstJsonObject(rawText) || rawText);
+  transcript = "Transcript unavailable.";
+  summaryText = "Summary unavailable.";
+  descriptionText = "Generated video.";
+  keywords = [];
 
-        transcript = parsed.transcript || "";
-        summaryText = parsed.summary || "";
-        descriptionText = parsed.description || "";
-        keywords = clampKeywords(parsed.keywords);
+} else {
 
-        parsedOk = true;
+  const rawText = stripCodeFences(aiResponse.text);
 
-      } catch (err) {
-        console.error("JSON parse failed:", err);
-        transcript = "Transcript unavailable.";
-      }
+  try {
+    const parsed = JSON.parse(extractFirstJsonObject(rawText) || rawText);
 
-    } else {
-      console.log("Gemini failed — fallback used");
-      transcript = "Transcript unavailable.";
-      summaryText = "Summary unavailable.";
-      descriptionText = "Generated video.";
-    }
+    transcript = parsed.transcript || "";
+    summaryText = parsed.summary || "";
+    descriptionText = parsed.description || "";
+    keywords = clampKeywords(parsed.keywords);
+
+    parsedOk = true;
+
+  } catch (err) {
+    console.error("JSON parse failed:", err);
+
+    transcript = "Transcript unavailable.";
+    summaryText = "Summary unavailable.";
+    descriptionText = "Generated video.";
+    keywords = [];
+  }
+}
 
     /**
      * =========
